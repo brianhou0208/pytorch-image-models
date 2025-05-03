@@ -5,6 +5,7 @@ Hacked together by / Copyright 2020 Ross Wightman
 import logging
 import os
 from typing import Any, Callable, Dict, Optional, Union
+from pickle import PickleError
 
 import torch
 try:
@@ -53,7 +54,7 @@ def load_state_dict(
         else:
             try:
                 checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=weights_only)
-            except TypeError:
+            except PickleError:
                 checkpoint = torch.load(checkpoint_path, map_location=device)
 
         state_dict_key = ''

@@ -4,6 +4,7 @@ import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from pickle import PickleError
 
 from torch import nn as nn
 from torch.hub import load_state_dict_from_url
@@ -195,7 +196,7 @@ def load_pretrained(
                     weights_only=True,
                     model_dir=cache_dir,
                 )
-            except TypeError:
+            except PickleError:
                 state_dict = load_state_dict_from_url(
                     pretrained_loc,
                     map_location='cpu',

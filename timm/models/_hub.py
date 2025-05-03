@@ -6,6 +6,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from pickle import PickleError
 
 import torch
 from torch.hub import HASH_REGEX, download_url_to_file, urlparse
@@ -249,7 +250,7 @@ def load_state_dict_from_hf(
     _logger.debug(f"[{model_id}] Safe alternative not found for '{filename}'. Loading weights using default pytorch.")
     try:
         state_dict = torch.load(cached_file, map_location='cpu', weights_only=weights_only)
-    except TypeError:
+    except PickleError:
         state_dict = torch.load(cached_file, map_location='cpu')
     return state_dict
 
