@@ -21,6 +21,7 @@ from .efficientformer_v2 import *
 from .efficientnet import *
 from .efficientvit_mit import *
 from .efficientvit_msra import *
+from .emo import *
 from .eva import *
 from .fasternet import *
 from .fastvit import *
