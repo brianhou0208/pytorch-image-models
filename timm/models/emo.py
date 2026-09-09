@@ -79,7 +79,6 @@ class iRMB(nn.Module):
             self.attn_drop = nn.Identity()
 
         self.v = nn.Sequential(
-            nn.Conv2d(dim_in, dim_mid, 1, **dd),
             nn.Conv2d(dim_in, self.dim_mid, 1, **dd),
             act_layer() if act_layer else nn.Identity(),
         )
