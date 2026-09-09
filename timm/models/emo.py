@@ -63,7 +63,7 @@ class iRMB(nn.Module):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.norm = norm_layer(dim_in, eps=1e-6, **dd) if norm_layer else nn.Identity()
-        dim_mid = int(dim_in * exp_ratio)
+        self.dim_mid = int(dim_in * exp_ratio)
         self.has_skip = (dim_in == dim_out and stride == 1)
         self.attn_s = attn_s
         self.dim_head = dim_head
@@ -80,17 +80,18 @@ class iRMB(nn.Module):
 
         self.v = nn.Sequential(
             nn.Conv2d(dim_in, dim_mid, 1, **dd),
+            nn.Conv2d(dim_in, self.dim_mid, 1, **dd),
             act_layer() if act_layer else nn.Identity(),
         )
 
         self.conv_local = nn.Sequential(
-            nn.Conv2d(dim_mid, dim_mid, dw_ks, stride, padding=dw_ks//2, groups=dim_mid, bias=False, **dd),
-            nn.BatchNorm2d(dim_mid, eps=1e-6, **dd),
+            nn.Conv2d(self.dim_mid, self.dim_mid, dw_ks, stride, padding=dw_ks//2, groups=self.dim_mid, bias=False, **dd),
+            nn.BatchNorm2d(self.dim_mid, eps=1e-6, **dd),
             nn.SiLU(),
         )
 
         self.proj_drop = nn.Dropout(drop)
-        self.proj = nn.Conv2d(dim_mid, dim_out, 1, bias=False, **dd)
+        self.proj = nn.Conv2d(self.dim_mid, dim_out, 1, bias=False, **dd)
         self.drop_path = DropPath(drop_path) if drop_path else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -99,20 +100,14 @@ class iRMB(nn.Module):
         _, _, H, W = x.shape
 
         if self.attn_s:
-            x, n1, n2 = self._window_partition_input(x, H, W)
-            b, _, h, w = x.shape
+            x, n1, n2 = self._pad_input(x, H, W)
+            x = self._window_partition(x, n1, n2)
 
-            qk = self.qk(x).view(b, 2, self.num_head, self.dim_head, h, w).flatten(-2)
-            qk = qk.permute(1, 0, 2, 4, 3).contiguous()
-            q, k = qk[0], qk[1]
-
-            attn_spa = (q @ k.transpose(-2, -1)) * self.scale
-            attn_spa = self.attn_drop(attn_spa.softmax(dim=-1))
-
+            attn_spa = self._qk_attn(x)
             x_spa = self._apply_attn(x, attn_spa)
             x_spa = self.v(x_spa)
 
-            x = self._window_reverse_output(x_spa, n1, n2)
+            x = self._window_reverse(x_spa, n1, n2)
             x = x[:, :, :H, :W]
         else:
             x = self.v(x)
@@ -126,7 +121,7 @@ class iRMB(nn.Module):
         x = shortcut + self.drop_path(x) if self.has_skip else x
         return x
 
-    def _window_partition_input(self, x: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, int, int]:
+    def _pad_input(self, x: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, int, int]:
         if self.window_size <= 0:
             window_size_W, window_size_H = W, H
         else:
@@ -136,18 +131,34 @@ class iRMB(nn.Module):
         pad_b = (window_size_H - H % window_size_H) % window_size_H
 
         x = F.pad(x, (0, pad_r, 0, pad_b))
-        Hp, Wp = H + pad_b, W + pad_r
-        n1, n2 = Hp // window_size_H, Wp // window_size_W
-
-        b, c, h, w = x.shape
-        x = x.view(b, c, h // n1, n1, w // n2, n2).permute(0, 3, 5, 1, 2, 4)
-        x = x.reshape(b * n1 * n2, c, h // n1, w // n2).contiguous()
+        n1, n2 = (H + pad_b) // window_size_H, (W + pad_r) // window_size_W
         return x, n1, n2
 
-    def _window_reverse_output(self, x: torch.Tensor, n1: int, n2: int) -> torch.Tensor:
+    def _window_partition(self, x: torch.Tensor, n1: int, n2: int, close: bool = False) -> torch.Tensor:
+        b, c, h, w = x.shape
+        if not close:
+            x = x.view(b, c, h // n1, n1, w // n2, n2).permute(0, 3, 5, 1, 2, 4)
+        else:
+            x = x.view(b, c, n1, h // n1, n2, w // n2).permute(0, 2, 4, 1, 3, 5)
+        return x.reshape(b * n1 * n2, c, h // n1, w // n2).contiguous()
+
+    def _window_reverse(self, x: torch.Tensor, n1: int, n2: int, close: bool = False) -> torch.Tensor:
         _, c, h, w = x.shape
-        x = x.view(-1, n1, n2, c, h, w).permute(0, 3, 4, 1, 5, 2).reshape(-1, c, h * n1, w * n2)
-        return x
+        x = x.view(-1, n1, n2, c, h, w)
+        if not close:
+            x = x.permute(0, 3, 4, 1, 5, 2)
+        else:
+            x = x.permute(0, 3, 1, 4, 2, 5)
+        return x.reshape(-1, c, h * n1, w * n2)
+
+    def _qk_attn(self, x: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+        qk = self.qk(x).view(b, 2, self.num_head, self.dim_head, h, w).flatten(-2)
+        qk = qk.permute(1, 0, 2, 4, 3).contiguous()
+        q, k = qk[0], qk[1]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        return self.attn_drop(attn.softmax(dim=-1))
 
     def _apply_attn(self, x: torch.Tensor, attn_spa: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
