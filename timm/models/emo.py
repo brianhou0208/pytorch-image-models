@@ -27,10 +27,9 @@ from timm.layers import (
     SelectAdaptivePool2d,
     SqueezeExcite,
     calculate_drop_path_rates,
-    create_act_layer,
-    create_conv2d,
-    create_norm_layer,
+    get_act_layer,
     get_device_dtype,
+    get_norm_layer,
     trunc_normal_,
 )
 
@@ -48,8 +47,8 @@ class iRMB(nn.Module):
             dim_in: int,
             dim_out: int,
             exp_ratio: float = 1.0,
-            norm_layer: str = 'batchnorm2d',
-            act_layer: str = 'relu',
+            norm_layer: Type[nn.Module] = nn.BatchNorm2d,
+            act_layer: Type[nn.Module] = nn.ReLU,
             dw_ks: int = 3,
             stride: int = 1,
             dim_head: int = 64,
@@ -63,10 +62,7 @@ class iRMB(nn.Module):
     ):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        if norm_layer:
-            self.norm = create_norm_layer(norm_layer, dim_in, eps=1e-6, **dd)
-        else:
-            self.norm = nn.Identity()
+        self.norm = norm_layer(dim_in, eps=1e-6, **dd) if norm_layer else nn.Identity()
         dim_mid = int(dim_in * exp_ratio)
         self.has_skip = (dim_in == dim_out and stride == 1)
         self.attn_s = attn_s
@@ -84,7 +80,7 @@ class iRMB(nn.Module):
 
         self.v = nn.Sequential(
             nn.Conv2d(dim_in, dim_mid, 1, **dd),
-            create_act_layer(act_layer) if act_layer else nn.Identity(),
+            act_layer() if act_layer else nn.Identity(),
         )
 
         self.conv_local = nn.Sequential(
@@ -103,7 +99,7 @@ class iRMB(nn.Module):
         _, _, H, W = x.shape
 
         if self.attn_s:
-            x, n1, n2, _, _ = self._window_partition_input(x, H, W)
+            x, n1, n2 = self._window_partition_input(x, H, W)
             b, _, h, w = x.shape
 
             qk = self.qk(x).view(b, 2, self.num_head, self.dim_head, h, w).flatten(-2)
@@ -130,12 +126,7 @@ class iRMB(nn.Module):
         x = shortcut + self.drop_path(x) if self.has_skip else x
         return x
 
-    def _window_partition_input(
-            self,
-            x: torch.Tensor,
-            H: int,
-            W: int,
-    ) -> Tuple[torch.Tensor, int, int, int, int]:
+    def _window_partition_input(self, x: torch.Tensor, H: int, W: int) -> Tuple[torch.Tensor, int, int]:
         if self.window_size <= 0:
             window_size_W, window_size_H = W, H
         else:
@@ -151,7 +142,7 @@ class iRMB(nn.Module):
         b, c, h, w = x.shape
         x = x.view(b, c, h // n1, n1, w // n2, n2).permute(0, 3, 5, 1, 2, 4)
         x = x.reshape(b * n1 * n2, c, h // n1, w // n2).contiguous()
-        return x, n1, n2, Hp, Wp
+        return x, n1, n2
 
     def _window_reverse_output(self, x: torch.Tensor, n1: int, n2: int) -> torch.Tensor:
         _, c, h, w = x.shape
@@ -172,8 +163,8 @@ class Stage(nn.Module):
             emb_dim_pre: int,
             embed_dim: int,
             exp_ratio: float = 1.0,
-            norm_layer: str = 'batchnorm2d',
-            act_layer: str = 'relu',
+            norm_layer: Type[nn.Module] = nn.BatchNorm2d,
+            act_layer: Type[nn.Module] = nn.ReLU,
             dw_ks: int = 3,
             dim_head: int = 64,
             window_size: int = 7,
@@ -187,45 +178,42 @@ class Stage(nn.Module):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.grad_checkpointing = False
-        if depth > 0:
-            self.downsample = iRMB(
-                emb_dim_pre,
+
+        self.downsample = iRMB(
+            emb_dim_pre,
+            embed_dim,
+            exp_ratio=exp_ratio * 2,
+            norm_layer=norm_layer,
+            act_layer=act_layer,
+            dw_ks=dw_ks,
+            stride=2,
+            dim_head=dim_head,
+            window_size=window_size,
+            attn_s=False,
+            attn_drop=attn_drop,
+            drop=drop,
+            drop_path=dpr[0],
+            **dd,
+        )
+        blocks = []
+        for j in range(1, depth):
+            blocks.append(iRMB(
                 embed_dim,
-                exp_ratio=exp_ratio * 2,
+                embed_dim,
+                exp_ratio=exp_ratio,
                 norm_layer=norm_layer,
                 act_layer=act_layer,
                 dw_ks=dw_ks,
-                stride=2,
+                stride=1,
                 dim_head=dim_head,
                 window_size=window_size,
-                attn_s=False,
+                attn_s=attn_s,
                 attn_drop=attn_drop,
                 drop=drop,
-                drop_path=dpr[0] if len(dpr) > 0 else 0.,
+                drop_path=dpr[j],
                 **dd,
-            )
-            blocks = []
-            for j in range(1, depth):
-                blocks.append(iRMB(
-                    embed_dim,
-                    embed_dim,
-                    exp_ratio=exp_ratio,
-                    norm_layer=norm_layer,
-                    act_layer=act_layer,
-                    dw_ks=dw_ks,
-                    stride=1,
-                    dim_head=dim_head,
-                    window_size=window_size,
-                    attn_s=attn_s,
-                    attn_drop=attn_drop,
-                    drop=drop,
-                    drop_path=dpr[j] if j < len(dpr) else 0.,
-                    **dd,
-                ))
-            self.blocks = nn.Sequential(*blocks) if blocks else nn.Identity()
-        else:
-            self.downsample = nn.Identity()
-            self.blocks = nn.Identity()
+            ))
+        self.blocks = nn.Sequential(*blocks) if blocks else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.downsample(x)
@@ -266,9 +254,9 @@ class EMO(nn.Module):
         self.feature_info = []
 
         self.patch_embed = nn.Sequential(
-            create_conv2d(in_chans, stem_dim, dw_kss[0], stride=2, bias=True, **dd),
-            create_norm_layer(norm_layers[0], stem_dim, eps=1e-6, **dd),
-            create_conv2d(stem_dim, stem_dim, dw_kss[0], stride=1, groups=stem_dim, bias=False, **dd),
+            nn.Conv2d(in_chans, stem_dim, dw_kss[0], 2, dw_kss[0]//2, **dd),
+            get_norm_layer(norm_layers[0])(stem_dim, eps=1e-6, **dd) if norm_layers[0] else nn.Identity(),
+            nn.Conv2d(stem_dim, stem_dim, dw_kss[0], 1, dw_kss[0]//2, groups=stem_dim, bias=False, **dd),
             nn.BatchNorm2d(stem_dim, eps=1e-6, **dd),
             nn.SiLU(),
             SqueezeExcite(stem_dim, rd_ratio=1, act_layer=act_layers[0], **dd),
@@ -286,8 +274,8 @@ class EMO(nn.Module):
                 emb_dim_pre=emb_dim_pre,
                 embed_dim=embed_dims[i],
                 exp_ratio=exp_ratios[i],
-                norm_layer=norm_layers[i],
-                act_layer=act_layers[i],
+                norm_layer=get_norm_layer(norm_layers[i]),
+                act_layer=get_act_layer(act_layers[i]),
                 dw_ks=dw_kss[i],
                 dim_head=dim_heads[i],
                 window_size=window_sizes[i],
@@ -304,7 +292,7 @@ class EMO(nn.Module):
             self.feature_info.append(dict(num_chs=embed_dims[i], reduction=reduction, module=f'stages.{i}'))
         self.stages = nn.Sequential(*stages)
 
-        self.norm = create_norm_layer(norm_layers[-1], embed_dims[-1], eps=1e-6, **dd)
+        self.norm = get_norm_layer(norm_layers[-1])(embed_dims[-1], eps=1e-6, **dd) if norm_layers[-1] else nn.Identity()
         self.num_features = self.head_hidden_size = embed_dims[-1]
         self.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
         self.flatten = nn.Flatten(1) if global_pool else nn.Identity()
@@ -490,7 +478,8 @@ def checkpoint_filter_fn(state_dict: Dict[str, torch.Tensor], model: nn.Module) 
 
 def _cfg(url: str = '', **kwargs: Any) -> Dict[str, Any]:
     return {
-        'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
+        'url': url,
+        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
         'crop_pct': 0.875, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'patch_embed.0', 'classifier': 'head',
