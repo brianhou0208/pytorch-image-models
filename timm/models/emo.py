@@ -1,6 +1,8 @@
 """ EMO
+EMO: Rethinking Mobile Block for Efficient Attention-based Models(ICCV2023)
+- paper: https://arxiv.org/abs/2301.01146
+- code: https://github.com/zhangzjn/EMO
 
-Paper: `Rethinking Mobile Block for Efficient Attention-based Models` - https://arxiv.org/abs/2301.01146
 @inproceedings{emo,
   title={Rethinking Mobile Block for Efficient Attention-based Models},
   author={Zhang, Jiangning and Li, Xiangtai and Li, Jian and Liu, Liang and Xue, Zhucun and Zhang, Boshen and Jiang, Zhengkai and Huang, Tianxin and Wang, Yabiao and Wang, Chengjie},
@@ -9,8 +11,10 @@ Paper: `Rethinking Mobile Block for Efficient Attention-based Models` - https://
   year={2023}
 }
 
-Original code and weights from:
-* https://github.com/zhangzjn/EMO
+EMOv2: Pushing 5M Vision Model Frontier(TPAMI2025)
+- paper: https://arxiv.org/abs/2412.06674
+- code: https://github.com/zhangzjn/EMOv2
+
 
 Modifications and additions for timm by / Copyright 2026, Ryan Hou & Ross Wightman
 """
@@ -23,6 +27,7 @@ import torch.nn.functional as F
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import (
     DropPath,
+    LayerScale2d,
     Linear,
     SelectAdaptivePool2d,
     SqueezeExcite,
@@ -57,6 +62,7 @@ class iRMB(nn.Module):
             attn_drop: float = 0.,
             drop: float = 0.,
             drop_path: float = 0.,
+            layer_scale_init_value: Optional[float] = None,
             device=None,
             dtype=None,
     ):
@@ -84,13 +90,26 @@ class iRMB(nn.Module):
         )
 
         self.conv_local = nn.Sequential(
-            nn.Conv2d(self.dim_mid, self.dim_mid, dw_ks, stride, padding=dw_ks//2, groups=self.dim_mid, bias=False, **dd),
+            nn.Conv2d(
+                in_channels=self.dim_mid,
+                out_channels=self.dim_mid,
+                kernel_size=dw_ks,
+                stride=stride,
+                padding=dw_ks//2,
+                groups=self.dim_mid,
+                bias=False,
+                **dd
+            ),
             nn.BatchNorm2d(self.dim_mid, eps=1e-6, **dd),
             nn.SiLU(),
         )
 
         self.proj_drop = nn.Dropout(drop)
         self.proj = nn.Conv2d(self.dim_mid, dim_out, 1, bias=False, **dd)
+        if layer_scale_init_value is not None:
+            self.layer_scale = LayerScale2d(dim_out, layer_scale_init_value, **dd)
+        else:
+            self.layer_scale = nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -102,7 +121,7 @@ class iRMB(nn.Module):
             x, n1, n2 = self._pad_input(x, H, W)
             x = self._window_partition(x, n1, n2)
 
-            attn_spa = self._qk_attn(x)
+            attn_spa = self._qk_attn(self.qk(x))
             x_spa = self._apply_attn(x, attn_spa)
             x_spa = self.v(x_spa)
 
@@ -117,6 +136,7 @@ class iRMB(nn.Module):
             x = self.conv_local(x)
         x = self.proj_drop(x)
         x = self.proj(x)
+        x = self.layer_scale(x)
         x = shortcut + self.drop_path(x) if self.has_skip else x
         return x
 
@@ -152,7 +172,7 @@ class iRMB(nn.Module):
 
     def _qk_attn(self, x: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
-        qk = self.qk(x).view(b, 2, self.num_head, self.dim_head, h, w).flatten(-2)
+        qk = x.view(b, 2, self.num_head, self.dim_head, h, w).flatten(-2)
         qk = qk.permute(1, 0, 2, 4, 3).contiguous()
         q, k = qk[0], qk[1]
 
@@ -164,6 +184,44 @@ class iRMB(nn.Module):
         x = x.view(b, self.num_head, c // self.num_head, h, w).flatten(-2).transpose(-1, -2)
         x_spa = attn_spa @ x
         return x_spa.transpose(-1, -2).reshape(b, c, h, w)
+
+
+class iiRMB(iRMB):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.norm(x)
+        _, _, H, W = x.shape
+
+        if self.attn_s:
+            # qk/v are pointwise: compute once on the padded map (official FLOPs parity),
+            # then partition per branch
+            x_pad, n1, n2 = self._pad_input(x, H, W)
+            qk_full = self.qk(x_pad)
+            v_full = self.v(x_pad)
+
+            qk_r = self._window_partition(qk_full, n1, n2, close=False)
+            v_r = self._window_partition(v_full, n1, n2, close=False)
+            attn_r = self._qk_attn(qk_r)
+            x_r = self._window_reverse(self._apply_attn(v_r, attn_r), n1, n2, close=False)
+
+            qk_c = self._window_partition(qk_full, n1, n2, close=True)
+            v_c = self._window_partition(v_full, n1, n2, close=True)
+            attn_c = self._qk_attn(qk_c)
+            x_c = self._window_reverse(self._apply_attn(v_c, attn_c), n1, n2, close=True)
+
+            x = (x_r + x_c)[:, :, :H, :W]
+        else:
+            x = self.v(x)
+
+        if self.has_skip:
+            x = x + self.conv_local(x)
+        else:
+            x = self.conv_local(x)
+        x = self.proj_drop(x)
+        x = self.proj(x)
+        x = self.layer_scale(x)
+        x = shortcut + self.drop_path(x) if self.has_skip else x
+        return x
 
 
 class Stage(nn.Module):
@@ -182,14 +240,17 @@ class Stage(nn.Module):
             drop: float = 0.,
             attn_drop: float = 0.,
             dpr: Optional[List[float]] = None,
+            layer_scale_init_value: Optional[float] = None,
+            version: str = 'v1',
             device=None,
             dtype=None,
     ):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.grad_checkpointing = False
+        BLK = iRMB if version == 'v1' else iiRMB
 
-        self.downsample = iRMB(
+        self.downsample = BLK(
             emb_dim_pre,
             embed_dim,
             exp_ratio=exp_ratio * 2,
@@ -203,11 +264,12 @@ class Stage(nn.Module):
             attn_drop=attn_drop,
             drop=drop,
             drop_path=dpr[0],
+            layer_scale_init_value=layer_scale_init_value,
             **dd,
         )
         blocks = []
         for j in range(1, depth):
-            blocks.append(iRMB(
+            blocks.append(BLK(
                 embed_dim,
                 embed_dim,
                 exp_ratio=exp_ratio,
@@ -221,6 +283,7 @@ class Stage(nn.Module):
                 attn_drop=attn_drop,
                 drop=drop,
                 drop_path=dpr[j],
+                layer_scale_init_value=layer_scale_init_value,
                 **dd,
             ))
         self.blocks = nn.Sequential(*blocks) if blocks else nn.Identity()
@@ -240,7 +303,6 @@ class EMO(nn.Module):
             in_chans: int = 3,
             num_classes: int = 1000,
             depths: Tuple[int, ...] = (1, 2, 4, 2),
-            stem_dim: int = 24,
             embed_dims: Tuple[int, ...] = (64, 128, 256, 512),
             exp_ratios: Tuple[float, ...] = (4., 4., 4., 4.),
             norm_layers: Tuple[str, ...] = ('batchnorm2d', 'batchnorm2d', 'layernorm2d', 'layernorm2d'),
@@ -252,27 +314,43 @@ class EMO(nn.Module):
             attn_drop: float = 0.,
             drop_rate: float = 0.,
             drop_path_rate: float = 0.,
+            layer_scale_init_value: Optional[float] = None,
+            version: str = 'v1',
             global_pool: str = 'avg',
             device=None,
             dtype=None,
     ):
         super().__init__()
+        assert version in ('v1', 'v2')
         dd = {'device': device, 'dtype': dtype}
         self.num_classes = num_classes
         self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.feature_info = []
 
-        self.patch_embed = nn.Sequential(
-            nn.Conv2d(in_chans, stem_dim, dw_kss[0], 2, dw_kss[0]//2, **dd),
-            get_norm_layer(norm_layers[0])(stem_dim, eps=1e-6, **dd) if norm_layers[0] else nn.Identity(),
-            nn.Conv2d(stem_dim, stem_dim, dw_kss[0], 1, dw_kss[0]//2, groups=stem_dim, bias=False, **dd),
-            nn.BatchNorm2d(stem_dim, eps=1e-6, **dd),
-            nn.SiLU(),
-            SqueezeExcite(stem_dim, rd_ratio=1, act_layer=act_layers[0], **dd),
-            nn.Dropout(drop_rate),
-            nn.Conv2d(stem_dim, stem_dim, 1, bias=False, **dd)
-        )
+        if version == 'v1':
+            stem_dim = 24
+            self.patch_embed = nn.Sequential(
+                nn.Conv2d(in_chans, stem_dim, dw_kss[0], 2, dw_kss[0]//2, **dd),
+                get_norm_layer(norm_layers[0])(stem_dim, eps=1e-6, **dd) if norm_layers[0] else nn.Identity(),
+                nn.Conv2d(stem_dim, stem_dim, dw_kss[0], 1, dw_kss[0]//2, groups=stem_dim, bias=False, **dd),
+                nn.BatchNorm2d(stem_dim, eps=1e-6, **dd),
+                nn.SiLU(),
+                SqueezeExcite(stem_dim, rd_ratio=1, act_layer=act_layers[0], **dd),
+                nn.Dropout(drop_rate),
+                nn.Conv2d(stem_dim, stem_dim, 1, bias=False, **dd)
+            )
+        else:
+            stem_dim = embed_dims[0] // 2
+            self.patch_embed = nn.Sequential(
+                nn.Conv2d(in_chans, stem_dim, 3, 2, 1, **dd),
+                nn.BatchNorm2d(stem_dim, eps=1e-6, **dd),
+                nn.SiLU(),
+                nn.Conv2d(stem_dim, stem_dim, 3, 1, 1, groups=stem_dim, bias=False, **dd),
+                nn.BatchNorm2d(stem_dim, eps=1e-6, **dd),
+                nn.SiLU(),
+                nn.Conv2d(stem_dim, stem_dim, 1, 1, 0, bias=False, **dd),
+            )
 
         dprs = calculate_drop_path_rates(drop_path_rate, sum(depths))
         emb_dim_pre = stem_dim
@@ -293,6 +371,8 @@ class EMO(nn.Module):
                 drop=drop_rate,
                 attn_drop=attn_drop,
                 dpr=dprs[sum(depths[:i]):sum(depths[:i + 1])],
+                layer_scale_init_value=layer_scale_init_value,
+                version=version,
                 device=device,
                 dtype=dtype,
             )
@@ -414,15 +494,15 @@ class EMO(nn.Module):
             prune_head: bool = True,
     ):
         """Prune layers not required for specified intermediates.
-        
-                Args:
-                    indices: Indices of intermediate layers to keep.
-                    prune_norm: Whether to prune normalization layer.
-                    prune_head: Whether to prune the classifier head.
-        
-                Returns:
-                    List of indices that were kept.
-                """
+
+        Args:
+            indices: Indices of intermediate layers to keep.
+            prune_norm: Whether to prune normalization layer.
+            prune_head: Whether to prune the classifier head.
+
+        Returns:
+            List of indices that were kept.
+        """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
         if prune_norm:
@@ -454,20 +534,38 @@ def checkpoint_filter_fn(state_dict: Dict[str, torch.Tensor], model: nn.Module) 
     import re
     out_dict = {}
     for k, v in state_dict.items():
-        if k.startswith('stage0.0.'):
-            k = k.replace('stage0.0.convs.0.0.', 'patch_embed.0.')
-            k = k.replace('stage0.0.convs.0.1.', 'patch_embed.1.')
-        elif k.startswith('stage0.1.'):
-            k = k.replace('stage0.1.conv_local.conv.', 'patch_embed.2.')
-            k = k.replace('stage0.1.conv_local.norm.', 'patch_embed.3.')
-            k = k.replace('stage0.1.se.', 'patch_embed.5.')
-            k = k.replace('stage0.1.proj.conv.', 'patch_embed.7.')
+        if k.startswith('stage0.'):
+            if 'convs.' in k or '.se.' in k or 'conv_local' in k or 'proj.' in k:
+                # v1 stem
+                k = k.replace('stage0.0.convs.0.0.', 'patch_embed.0.')
+                k = k.replace('stage0.0.convs.0.1.', 'patch_embed.1.')
+                k = k.replace('stage0.1.conv_local.conv.', 'patch_embed.2.')
+                k = k.replace('stage0.1.conv_local.norm.', 'patch_embed.3.')
+                k = k.replace('stage0.1.se.', 'patch_embed.5.')
+                k = k.replace('stage0.1.proj.conv.', 'patch_embed.7.')
+            else:
+                # v2 stem: 3x ConvNormAct (conv/bn, dw-conv/bn, 1x1 conv, no SE)
+                k = k.replace('stage0.0.conv.', 'patch_embed.0.')
+                k = k.replace('stage0.0.norm.', 'patch_embed.1.')
+                k = k.replace('stage0.1.conv.', 'patch_embed.3.')
+                k = k.replace('stage0.1.norm.', 'patch_embed.4.')
+                k = k.replace('stage0.2.conv.', 'patch_embed.6.')
         else:
             m = re.match(r'stage([1-4])\.(\d+)\.(.*)', k)
             if m:
                 stage_idx = int(m.group(1)) - 1
                 block_idx = int(m.group(2))
                 rest = m.group(3)
+                if 'eops.0.' in rest:
+                    # v2 block: eops.0.qk/v.conv.* (hybrid) / eops.0.net.conv.* (downsample Conv eop)
+                    rest = rest.replace('eops.0.qk.conv.', 'qk.')
+                    rest = rest.replace('eops.0.v.conv.', 'v.0.')
+                    rest = rest.replace('eops.0.net.conv.', 'v.0.')
+                if rest == 'ls.gamma':
+                    # v2 LayerScale: official (1, C, 1, 1) -> timm LayerScale2d (C,)
+                    rest = 'layer_scale.gamma'
+                    if v.dim() == 4:
+                        v = v.reshape(-1)
                 if block_idx == 0:
                     k = f'stages.{stage_idx}.downsample.{rest}'
                 else:
@@ -493,9 +591,6 @@ def _cfg(url: str = '', **kwargs: Any) -> Dict[str, Any]:
         'crop_pct': 0.875, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'patch_embed.0', 'classifier': 'head',
-        'paper_ids': 'arXiv:2301.01146',
-        'paper_name': 'Rethinking Mobile Block for Efficient Attention-based Models',
-        'origin_url': 'https://github.com/zhangzjn/EMO',
         **kwargs
     }
 
@@ -517,6 +612,31 @@ default_cfgs = generate_default_cfgs({
         # hf_hub_id='timm/',
         # url='https://github.com/zhangzjn/EMO/blob/main/resources/EMO_6M/net.pth'
     ),
+    'emo2_1m.in1k': _cfg(
+        # hf_hub_id='timm/',
+        # url='https://github.com/zhangzjn/EMOv2/blob/main/resources/Cls/EMOv2_1M_224.pth'
+    ),
+    'emo2_1m.dist_in1k': _cfg(
+        # hf_hub_id='timm/',
+        # url='https://github.com/zhangzjn/EMOv2/blob/main/resources/Cls/EMOv2_1M_224_KD.pth'
+    ),
+    'emo2_2m.in1k': _cfg(
+        # hf_hub_id='timm/',
+        # url='https://github.com/zhangzjn/EMOv2/blob/main/resources/Cls/EMOv2_2M_224.pth'
+    ),
+    'emo2_2m.dist_in1k': _cfg(
+        # hf_hub_id='timm/',
+        # url='https://github.com/zhangzjn/EMOv2/blob/main/resources/Cls/EMOv2_2M_224_KD.pth'
+    ),
+    'emo2_5m.in1k': _cfg(
+        # hf_hub_id='timm/',
+        # url='https://github.com/zhangzjn/EMOv2/blob/main/resources/Cls/EMOv2_5M_224.pth'
+    ),
+    'emo2_5m.dist_in1k': _cfg(
+        # hf_hub_id='timm/',
+        # url='https://github.com/zhangzjn/EMOv2/blob/main/resources/Cls/EMOv2_5M_224_KD.pth'
+    ),
+    'emo2_20m.untrained': _cfg(),
 })
 
 
@@ -537,7 +657,7 @@ def emo_1m(pretrained: bool = False, **kwargs: Any) -> EMO:
         depths=(2, 2, 8, 3), embed_dims=(32, 48, 80, 168), exp_ratios=(2., 2.5, 3.0, 3.5),
         dim_heads=(16, 16, 20, 21), drop_path_rate=0.04036,
     )
-    return _create_emo('emo_1m', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_emo('emo_1m', pretrained=pretrained, version='v1', **dict(model_args, **kwargs))
 
 
 @register_model
@@ -547,7 +667,7 @@ def emo_2m(pretrained: bool = False, **kwargs: Any) -> EMO:
         depths=(3, 3, 9, 3), embed_dims=(32, 48, 120, 200), exp_ratios=(2., 2.5, 3.0, 3.5),
         dim_heads=(16, 16, 20, 20), drop_path_rate=0.05,
     )
-    return _create_emo('emo_2m', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_emo('emo_2m', pretrained=pretrained, version='v1', **dict(model_args, **kwargs))
 
 
 @register_model
@@ -557,7 +677,7 @@ def emo_5m(pretrained: bool = False, **kwargs: Any) -> EMO:
         depths=(3, 3, 9, 3), embed_dims=(48, 72, 160, 288), exp_ratios=(2., 3., 4., 4.),
         dim_heads=(24, 24, 32, 32), drop_path_rate=0.05,
     )
-    return _create_emo('emo_5m', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_emo('emo_5m', pretrained=pretrained, version='v1', **dict(model_args, **kwargs))
 
 
 @register_model
@@ -567,4 +687,43 @@ def emo_6m(pretrained: bool = False, **kwargs: Any) -> EMO:
         depths=(3, 3, 9, 3), embed_dims=(48, 72, 160, 320), exp_ratios=(2., 3., 4., 5.),
         dim_heads=(16, 24, 20, 32), drop_path_rate=0.05,
     )
-    return _create_emo('emo_6m', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_emo('emo_6m', pretrained=pretrained, version='v1', **dict(model_args, **kwargs))
+
+
+@register_model
+def emo2_1m(pretrained: bool = False, **kwargs: Any) -> EMO:
+    """ EMO2-1M """
+    model_args = dict(
+        depths=(2, 2, 8, 3), embed_dims=(32, 48, 80, 180), exp_ratios=(2., 2.5, 3.0, 3.5),
+        dim_heads=(16, 16, 20, 20), drop_path_rate=0.04036, layer_scale_init_value=1e-6, dw_kss=(5, 5, 5, 5),
+    )
+    return _create_emo('emo2_1m', pretrained=pretrained, version='v2', **dict(model_args, **kwargs))
+
+
+@register_model
+def emo2_2m(pretrained: bool = False, **kwargs: Any) -> EMO:
+    """ EMO2-2M """
+    model_args = dict(
+        depths=(3, 3, 9, 3), embed_dims=(32, 48, 120, 200), exp_ratios=(2., 2.5, 3.0, 3.5),
+        dim_heads=(16, 16, 20, 20), drop_path_rate=0.05, layer_scale_init_value=1e-6, dw_kss=(5, 5, 5, 5),
+    )
+    return _create_emo('emo2_2m', pretrained=pretrained, version='v2', **dict(model_args, **kwargs))
+
+
+@register_model
+def emo2_5m(pretrained: bool = False, **kwargs: Any) -> EMO:
+    """ EMO2-5M """
+    model_args = dict(
+        depths=(3, 3, 9, 3), embed_dims=(48, 72, 160, 288), exp_ratios=(2., 3., 4., 4.),
+        dim_heads=(16, 24, 32, 32), drop_path_rate=0.05, layer_scale_init_value=1e-6, dw_kss=(5, 5, 5, 5),
+    )
+    return _create_emo('emo2_5m', pretrained=pretrained, version='v2', **dict(model_args, **kwargs))
+
+@register_model
+def emo2_20m(pretrained: bool = False, **kwargs: Any) -> EMO:
+    """ EMO2-20M """
+    model_args = dict(
+        depths=(3, 3, 13, 3), embed_dims=(64, 128, 320, 448), exp_ratios=(2., 3., 4., 4.),
+        dim_heads=(16, 32, 32, 32), drop_path_rate=0.1, layer_scale_init_value=1e-6, dw_kss=(5, 5, 5, 5),
+    )
+    return _create_emo('emo2_20m', pretrained=pretrained, version='v2', **dict(model_args, **kwargs))
