@@ -15,6 +15,13 @@ EMOv2: Pushing 5M Vision Model Frontier(TPAMI2025)
 - paper: https://arxiv.org/abs/2412.06674
 - code: https://github.com/zhangzjn/EMOv2
 
+@article{zhang2025emov2,
+  title={Emov2: Pushing 5 m vision model frontier},
+  author={Zhang, Jiangning and Hu, Teng and He, Haoyang and Xue, Zhucun and Wang, Yabiao and Wang, Chengjie and Liu, Yong and Li, Xiangtai and Tao, Dacheng},
+  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  year={2025},
+  publisher={IEEE}
+}
 
 Modifications and additions for timm by / Copyright 2026, Ryan Hou & Ross Wightman
 """
@@ -63,6 +70,7 @@ class iRMB(nn.Module):
             drop: float = 0.,
             drop_path: float = 0.,
             layer_scale_init_value: Optional[float] = None,
+            version: str = 'v1',
             device=None,
             dtype=None,
     ):
@@ -76,6 +84,8 @@ class iRMB(nn.Module):
         self.window_size = window_size
         self.num_head = dim_in // dim_head if dim_in % dim_head == 0 else 0
         self.scale = self.dim_head ** -0.5 if self.num_head else 0.
+        self.version = version
+
         if self.attn_s:
             assert dim_in % dim_head == 0, 'dim should be divisible by num_heads'
             self.qk = nn.Conv2d(dim_in, int(dim_in * 2), 1, **dd)
@@ -118,14 +128,27 @@ class iRMB(nn.Module):
         _, _, H, W = x.shape
 
         if self.attn_s:
-            x, n1, n2 = self._pad_input(x, H, W)
-            x = self._window_partition(x, n1, n2)
+            x_pad, n1, n2 = self._pad_input(x, H, W)
+            if self.version == 'v1':
+                x_pad = self._window_partition(x_pad, n1, n2, close=False)
+                attn_spa = self._qk_attn(self.qk(x_pad))
+                x_spa = self._apply_attn(x_pad, attn_spa)
+                x_spa = self.v(x_spa)
+                x = self._window_reverse(x_spa, n1, n2, close=False)
+            else:
+                qk_full = self.qk(x_pad)
+                v_full = self.v(x_pad)
 
-            attn_spa = self._qk_attn(self.qk(x))
-            x_spa = self._apply_attn(x, attn_spa)
-            x_spa = self.v(x_spa)
+                qk_r = self._window_partition(qk_full, n1, n2, close=False)
+                v_r = self._window_partition(v_full, n1, n2, close=False)
+                attn_r = self._qk_attn(qk_r)
+                x_r = self._window_reverse(self._apply_attn(v_r, attn_r), n1, n2, close=False)
 
-            x = self._window_reverse(x_spa, n1, n2)
+                qk_c = self._window_partition(qk_full, n1, n2, close=True)
+                v_c = self._window_partition(v_full, n1, n2, close=True)
+                attn_c = self._qk_attn(qk_c)
+                x_c = self._window_reverse(self._apply_attn(v_c, attn_c), n1, n2, close=True)
+                x = x_r + x_c
             x = x[:, :, :H, :W]
         else:
             x = self.v(x)
@@ -186,44 +209,6 @@ class iRMB(nn.Module):
         return x_spa.transpose(-1, -2).reshape(b, c, h, w)
 
 
-class iiRMB(iRMB):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shortcut = x
-        x = self.norm(x)
-        _, _, H, W = x.shape
-
-        if self.attn_s:
-            # qk/v are pointwise: compute once on the padded map (official FLOPs parity),
-            # then partition per branch
-            x_pad, n1, n2 = self._pad_input(x, H, W)
-            qk_full = self.qk(x_pad)
-            v_full = self.v(x_pad)
-
-            qk_r = self._window_partition(qk_full, n1, n2, close=False)
-            v_r = self._window_partition(v_full, n1, n2, close=False)
-            attn_r = self._qk_attn(qk_r)
-            x_r = self._window_reverse(self._apply_attn(v_r, attn_r), n1, n2, close=False)
-
-            qk_c = self._window_partition(qk_full, n1, n2, close=True)
-            v_c = self._window_partition(v_full, n1, n2, close=True)
-            attn_c = self._qk_attn(qk_c)
-            x_c = self._window_reverse(self._apply_attn(v_c, attn_c), n1, n2, close=True)
-
-            x = (x_r + x_c)[:, :, :H, :W]
-        else:
-            x = self.v(x)
-
-        if self.has_skip:
-            x = x + self.conv_local(x)
-        else:
-            x = self.conv_local(x)
-        x = self.proj_drop(x)
-        x = self.proj(x)
-        x = self.layer_scale(x)
-        x = shortcut + self.drop_path(x) if self.has_skip else x
-        return x
-
-
 class Stage(nn.Module):
     def __init__(
             self,
@@ -248,9 +233,8 @@ class Stage(nn.Module):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.grad_checkpointing = False
-        BLK = iRMB if version == 'v1' else iiRMB
 
-        self.downsample = BLK(
+        self.downsample = iRMB(
             emb_dim_pre,
             embed_dim,
             exp_ratio=exp_ratio * 2,
@@ -265,11 +249,12 @@ class Stage(nn.Module):
             drop=drop,
             drop_path=dpr[0],
             layer_scale_init_value=layer_scale_init_value,
+            version=version,
             **dd,
         )
         blocks = []
         for j in range(1, depth):
-            blocks.append(BLK(
+            blocks.append(iRMB(
                 embed_dim,
                 embed_dim,
                 exp_ratio=exp_ratio,
@@ -284,6 +269,7 @@ class Stage(nn.Module):
                 drop=drop,
                 drop_path=dpr[j],
                 layer_scale_init_value=layer_scale_init_value,
+                version=version,
                 **dd,
             ))
         self.blocks = nn.Sequential(*blocks) if blocks else nn.Identity()
