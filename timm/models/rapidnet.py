@@ -568,6 +568,8 @@ def checkpoint_filter_fn(state_dict: Dict[str, torch.Tensor], model: nn.Module) 
     """
     state_dict = state_dict.get('state_dict', state_dict)
     state_dict = state_dict.get('model', state_dict)
+    if 'stem.0.conv.weight' in state_dict:
+        return state_dict
     # local (InvertedResidual) blocks own `.dws.` keys and use `layer_scale`,
     # global (MLDC_LKFFN) blocks use `layer_scale_1/2`; record (stage, block) idx
     local_idx = set()
