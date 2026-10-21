@@ -61,6 +61,7 @@ from .nfnet import *
 from .pit import *
 from .pnasnet import *
 from .pvt_v2 import *
+from .rapidnet import *
 from .rdnet import *
 from .regnet import *
 from .repghost import *
@@ -81,6 +82,7 @@ from .swin_transformer import *
 from .swin_transformer_v2 import *
 from .swin_transformer_v2_cr import *
 from .tiny_vit import *
+from .tinynext import *
 from .tnt import *
 from .tresnet import *
 from .twins import *
