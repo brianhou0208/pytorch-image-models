@@ -24,6 +24,7 @@ from .efficientnet import *
 from .efficientvim import *
 from .efficientvit_mit import *
 from .efficientvit_msra import *
+from .emo import *
 from .eva import *
 from .fasternet import *
 from .fastvit import *
