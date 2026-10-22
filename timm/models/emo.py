@@ -25,6 +25,7 @@ EMOv2: Pushing 5M Vision Model Frontier(TPAMI2025)
 
 Modifications and additions for timm by / Copyright 2026, Ryan Hou & Ross Wightman
 """
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
@@ -108,7 +109,7 @@ class iRMB(nn.Module):
                 padding=dw_ks//2,
                 groups=self.dim_mid,
                 bias=False,
-                **dd
+                **dd,
             ),
             nn.BatchNorm2d(self.dim_mid, eps=1e-6, **dd),
             nn.SiLU(),
@@ -339,13 +340,13 @@ class EMO(nn.Module):
             )
 
         dprs = calculate_drop_path_rates(drop_path_rate, sum(depths))
-        emb_dim_pre = stem_dim
+        prev_dim = stem_dim
         stages = []
         reduction = 2
         for i in range(len(depths)):
             stage = Stage(
                 depth=depths[i],
-                emb_dim_pre=emb_dim_pre,
+                emb_dim_pre=prev_dim,
                 embed_dim=embed_dims[i],
                 exp_ratio=exp_ratios[i],
                 norm_layer=get_norm_layer(norm_layers[i]),
@@ -362,7 +363,7 @@ class EMO(nn.Module):
                 device=device,
                 dtype=dtype,
             )
-            emb_dim_pre = embed_dims[i]
+            prev_dim = embed_dims[i]
             stages.append(stage)
             reduction *= 2
             self.feature_info.append(dict(num_chs=embed_dims[i], reduction=reduction, module=f'stages.{i}'))
@@ -389,7 +390,7 @@ class EMO(nn.Module):
             nn.init.ones_(module.weight)
 
     @torch.jit.ignore
-    def no_weight_decay(self) -> Set:
+    def no_weight_decay(self) -> Set[str]:
         return set()
 
     @torch.jit.ignore
@@ -433,7 +434,7 @@ class EMO(nn.Module):
             output_fmt: str = 'NCHW',
             intermediates_only: bool = False,
     ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
+        """Forward features that returns intermediates.
 
         Args:
             x: Input image tensor
@@ -469,7 +470,8 @@ class EMO(nn.Module):
         if intermediates_only:
             return intermediates
 
-        x = self.norm(x)
+        if feat_idx == last_idx:
+            x = self.norm(x)
 
         return x, intermediates
 
@@ -478,7 +480,7 @@ class EMO(nn.Module):
             indices: Union[int, List[int]] = 1,
             prune_norm: bool = False,
             prune_head: bool = True,
-    ):
+    ) -> List[int]:
         """Prune layers not required for specified intermediates.
 
         Args:
@@ -517,7 +519,6 @@ class EMO(nn.Module):
 
 
 def checkpoint_filter_fn(state_dict: Dict[str, torch.Tensor], model: nn.Module) -> Dict[str, torch.Tensor]:
-    import re
     out_dict = {}
     for k, v in state_dict.items():
         if k.startswith('stage0.'):
