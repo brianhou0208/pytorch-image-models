@@ -638,6 +638,7 @@ class RegNet(nn.Module):
             final_act = cfg.linear_out or cfg.preact
             self.final_conv = get_act_layer(cfg.act_layer)() if final_act else nn.Identity()
             self.num_features = prev_width
+        self.head_hidden_size = self.num_features
         self.head = ClassifierHead(
             in_features=self.num_features,
             num_classes=num_classes,
@@ -645,7 +646,6 @@ class RegNet(nn.Module):
             drop_rate=drop_rate,
             **dd,
         )
-        self.head_hidden_size = self.head.num_features
 
         named_apply(partial(_init_weights, zero_init_last=zero_init_last), self)
 
@@ -733,8 +733,7 @@ class RegNet(nn.Module):
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, pool_type=global_pool, in_features=self.num_features, **dd)
-        self.head_hidden_size = self.head.num_features
+        self.head.reset(num_classes, pool_type=global_pool, **dd)
 
     def forward_intermediates(
             self,
@@ -801,18 +800,13 @@ class RegNet(nn.Module):
             List of indices that were kept.
         """
         take_indices, max_index = feature_take_indices(5, indices)
-        # final conv (w/ norm) never feeds the features (norm or not), it's removed w/ the head or norm
-        prune_end = max_index < 4 or ((prune_norm or prune_head) and isinstance(self.final_conv, ConvNormAct))
         layer_names = ('s1', 's2', 's3', 's4')
         layer_names = layer_names[max_index:]
         for n in layer_names:
             setattr(self, n, nn.Identity())
-        if prune_end:
-            # final conv (w/ norm) follows the last stage and isn't part of the features, like EfficientNet conv_head
+        if max_index < 4:
             self.final_conv = nn.Identity()
-            # features now end at the last kept tap, the head is sized for the final features so it goes too
-            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
-        if prune_head or prune_end:
+        if prune_head:
             self.reset_classifier(0, '')
         return take_indices
 
